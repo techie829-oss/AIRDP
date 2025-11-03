@@ -2,11 +2,16 @@ name: AIRDP
 
 on:
   workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'RDP Password (leave empty for auto-generate)'
+        required: false
+        default: ''
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 hours (reduced from 3600)
+    timeout-minutes: 34560  # 24 days
 
     steps:
       - name: Configure Core RDP Settings
@@ -19,34 +24,40 @@ jobs:
           Restart-Service -Name TermService -Force
           Write-Host "RDP configured successfully"
 
-      - name: Create RDP User with Secure Password
+      - name: Disable Sleep and Power Management
+        run: |
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change monitor-timeout-dc 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change standby-timeout-dc 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /change hibernate-timeout-dc 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /change disk-timeout-dc 0
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name 'HibernateEnabled' -Value 0 -Force
+          Write-Host "Sleep disabled"
+
+      - name: Create RDP User with Password
         run: |
           try {
-            Add-Type -AssemblyName System.Security
-            
-            $charSet = @{
-              Upper = [char[]](65..90)
-              Lower = [char[]](97..122)
-              Number = [char[]](48..57)
-              Special = [char[]](33,35,36,37,38,42,43,45,61,63,64,95)
+            $customPassword = "${{ github.event.inputs.rdp_password }}"
+            if ([string]::IsNullOrWhiteSpace($customPassword)) {
+              $password = "Auto$(Get-Random -Minimum 100000 -Maximum 999999)"
+              Write-Host "Generated password: $password"
+            } else {
+              $password = $customPassword
+              Write-Host "Using custom password"
             }
-            $rawPassword = @()
-            $rawPassword += $charSet.Upper | Get-Random -Count 4
-            $rawPassword += $charSet.Lower | Get-Random -Count 4
-            $rawPassword += $charSet.Number | Get-Random -Count 4
-            $rawPassword += $charSet.Special | Get-Random -Count 4
-            $password = -join ($rawPassword | Sort-Object { Get-Random })
             $securePass = ConvertTo-SecureString $password -AsPlainText -Force
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
             Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
             echo "RDP_USER=RDP" >> $env:GITHUB_ENV
             echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-            $user = Get-LocalUser -Name "RDP" -ErrorAction Stop
-            Write-Host "User 'RDP' created successfully"
+            Write-Host "User created successfully"
           }
           catch {
-            Write-Error "Failed to create RDP user: $_"
+            Write-Error "Failed to create user: $_"
             exit 1
           }
 
@@ -55,18 +66,16 @@ jobs:
           try {
             $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
             $installerPath = "$env:TEMP\tailscale.msi"
-            
             Write-Host "Downloading Tailscale..."
             Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
             Write-Host "Installing Tailscale..."
             Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
             Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 10
-            
             if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-              Write-Host "Tailscale installed successfully"
+              Write-Host "Tailscale installed"
             } else {
-              throw "Tailscale executable not found"
+              throw "Tailscale not found"
             }
           }
           catch {
@@ -87,31 +96,28 @@ jobs:
               Start-Sleep -Seconds 3
               $tsIP = (& $tailscaleExe ip -4) -replace '\s',''
               $retries++
-              Write-Host "Waiting for Tailscale IP... (Attempt $retries/$maxRetries)"
+              Write-Host "Waiting for IP... (Attempt $retries/$maxRetries)"
             }
             if (-not $tsIP) {
-              throw "Tailscale IP not assigned after $maxRetries attempts"
+              throw "Tailscale IP not assigned"
             }
             echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-            Write-Host "Tailscale connected with IP: $tsIP"
+            Write-Host "Connected with IP: $tsIP"
           }
           catch {
-            Write-Error "Failed to establish Tailscale connection: $_"
+            Write-Error "Failed to connect Tailscale: $_"
             exit 1
           }
 
       - name: Verify RDP Accessibility
         run: |
           try {
-            Write-Host "Testing RDP accessibility on $env:TAILSCALE_IP..."
-            
+            Write-Host "Testing RDP on $env:TAILSCALE_IP..."
             $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-            
             if (-not $testResult) {
-              throw "TCP connection to RDP port 3389 failed"
+              throw "RDP port 3389 not accessible"
             }
-            
-            Write-Host "✓ RDP is accessible on port 3389"
+            Write-Host "RDP is accessible"
           }
           catch {
             Write-Error "RDP verification failed: $_"
@@ -120,6 +126,18 @@ jobs:
 
       - name: Display Connection Info and Maintain Session
         run: |
+          Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            public class PowerManagement {
+                [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+                public static extern uint SetThreadExecutionState(uint esFlags);
+                public const uint ES_CONTINUOUS = 0x80000000;
+                public const uint ES_SYSTEM_REQUIRED = 0x00000001;
+                public const uint ES_DISPLAY_REQUIRED = 0x00000002;
+            }
+"@
+          [PowerManagement]::SetThreadExecutionState([PowerManagement]::ES_CONTINUOUS -bor [PowerManagement]::ES_SYSTEM_REQUIRED -bor [PowerManagement]::ES_DISPLAY_REQUIRED)
           Write-Host "`n================================================"
           Write-Host "           RDP CONNECTION DETAILS"
           Write-Host "================================================"
@@ -127,14 +145,20 @@ jobs:
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
           Write-Host "================================================"
-          Write-Host "Session will remain active. Cancel workflow to terminate."
+          Write-Host "Runtime: 24 days (34,560 minutes)"
+          Write-Host "Sleep: DISABLED"
+          Write-Host "Cancel workflow to terminate"
           Write-Host "================================================`n"
-          
-          # Keep the session alive
           $counter = 0
+          $startTime = Get-Date
           while ($true) {
             $counter++
             $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            Write-Host "[$timestamp] Session active (heartbeat #$counter)"
-            Start-Sleep -Seconds 300  # 5 minutes
+            $elapsed = (Get-Date) - $startTime
+            $days = [math]::Floor($elapsed.TotalDays)
+            $hours = $elapsed.Hours
+            $minutes = $elapsed.Minutes
+            Write-Host "[$timestamp] Active - Uptime: ${days}d ${hours}h ${minutes}m (heartbeat #$counter)"
+            [PowerManagement]::SetThreadExecutionState([PowerManagement]::ES_CONTINUOUS -bor [PowerManagement]::ES_SYSTEM_REQUIRED -bor [PowerManagement]::ES_DISPLAY_REQUIRED)
+            Start-Sleep -Seconds 300
           }
